@@ -3,12 +3,11 @@ from supabase import create_client
 from datetime import datetime, timedelta, timezone
 import time
 
-# --- 1. CONFIG & CONNECTION ---
+# --- 1. CONFIG ---
 st.set_page_config(page_title="PerzChat Pro", page_icon="🛡️", layout="wide")
 
 @st.cache_resource
 def init_connection():
-    # These must be set in Streamlit Cloud -> Settings -> Secrets
     return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 supabase = init_connection()
@@ -16,32 +15,47 @@ supabase = init_connection()
 if "user" not in st.session_state:
     st.session_state.user = None
 
-# --- 2. AUTHENTICATION UI ---
+# --- [AUTHENTICATION LOGIC] ---
 if not st.session_state.user:
     st.title("🛡️ PerzChat")
     tabs = st.tabs(["Login", "Create Account"])
     
+    # --- REFRESHED LOGIN LOGIC ---
     with tabs[0]:
         login_id = st.text_input("Username or Email", key="l_id").lower().strip()
         l_pwd = st.text_input("Password", type="password", key="l_pwd")
         
         if st.button("Sign In", type="primary", use_container_width=True):
-            try:
-                target_email = login_id
-                if "@" not in login_id:
-                    # Call the SQL function we created in the last step
-                    rpc_res = supabase.rpc("get_email_from_username", {"input_username": login_id}).execute()
-                    if rpc_res.data:
-                        target_email = rpc_res.data
-                    else:
-                        st.error("Username not found.")
-                        st.stop()
-                
-                auth_res = supabase.auth.sign_in_with_password({"email": target_email, "password": l_pwd})
-                st.session_state.user = auth_res.user
-                st.rerun()
-            except:
-                st.error("Login failed. Check your password.")
+            if not login_id or not l_pwd:
+                st.warning("Please enter both credentials.")
+            else:
+                try:
+                    target_email = login_id
+                    
+                    # If the user didn't type an '@', assume it's a username
+                    if "@" not in login_id:
+                        # Call our new SQL function to find the email
+                        rpc_res = supabase.rpc("get_email_from_username", {"input_username": login_id}).execute()
+                        
+                        if rpc_res.data:
+                            target_email = rpc_res.data
+                        else:
+                            st.error("Username not found.")
+                            st.stop()
+                    
+                    # Now perform the actual Supabase Auth login
+                    auth_res = supabase.auth.sign_in_with_password({
+                        "email": target_email, 
+                        "password": l_pwd
+                    })
+                    
+                    st.session_state.user = auth_res.user
+                    st.success("Welcome back!")
+                    time.sleep(1)
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error("Login failed. Please check your credentials.")
 
     with tabs[1]:
         r_email = st.text_input("Email", key="r_email").lower().strip()
@@ -53,14 +67,14 @@ if not st.session_state.user:
             else:
                 try:
                     supabase.auth.sign_up({"email": r_email, "password": r_pwd, "options": {"data": {"display_name": r_user}}})
-                    st.success("Account created! You can now log in.")
+                    st.success("Account created! Log in now.")
                 except Exception as e: st.error(f"Error: {e}")
 
-# --- 3. MAIN APP ---
+# --- 2. MAIN APP ---
 else:
     my_id = st.session_state.user.id
     
-    # Update Presence
+    # Update Status and Get My Profile
     supabase.table("profiles").update({"last_seen": "now()"}).eq("id", my_id).execute()
     my_prof = supabase.table("profiles").select("username").eq("id", my_id).maybe_single().execute()
     my_username = my_prof.data['username'] if my_prof.data else "User"
@@ -79,10 +93,11 @@ else:
                 st.rerun()
             else: st.error("Not found.")
 
-    # Fetch Contacts & Groups
+    # Fetch Data
     c_res = supabase.table("private_contacts").select("contact_id, profiles!contact_id(username, last_seen, typing_to)").eq("owner_id", my_id).execute()
     g_res = supabase.table("group_members").select("group_id, groups(name)").eq("user_id", my_id).execute()
 
+    # Build Navigation
     nav_dict = {}
     for c in c_res.data:
         p = c['profiles']
@@ -113,15 +128,10 @@ else:
     # --- CHAT AREA ---
     if selection:
         chat = nav_dict[selection]
+        st.title(selection)
         
-        col_t, col_i = st.columns([0.7, 0.3])
-        col_t.title(selection)
-
-        if chat['type'] == "room":
-            with col_i.expander("ℹ️ Room Settings"):
-                m_res = supabase.table("group_members").select("profiles(username)").eq("group_id", chat['id']).execute()
-                st.write(f"**Members:** {', '.join([m['profiles']['username'] for m in m_res.data])}")
-        else:
+        # Typing Logic
+        if chat['type'] == "dm":
             supabase.table("profiles").update({"typing_to": chat['id']}).eq("id", my_id).execute()
             supabase.table("messages").update({"is_read": True}).eq("user_id", chat['id']).eq("receiver_id", my_id).execute()
         
