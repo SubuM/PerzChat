@@ -21,8 +21,6 @@ if 'profile' not in st.session_state:
     st.session_state.profile = None
 if 'chat_with' not in st.session_state:
     st.session_state.chat_with = None
-if 'confirm_delete' not in st.session_state:
-    st.session_state.confirm_delete = False
 
 # --- AUTHENTICATION FUNCTIONS ---
 def get_email_from_username(username):
@@ -102,6 +100,7 @@ if not st.session_state.user:
 
 else:
     # --- PRE-PROCESSING: MARK AS READ ---
+    # Done before UI rendering so the sidebar badges are instantly accurate
     if st.session_state.chat_with:
         my_id = st.session_state.user.id
         their_id = st.session_state.chat_with['id']
@@ -119,7 +118,6 @@ else:
             st.session_state.user = None
             st.session_state.profile = None
             st.session_state.chat_with = None
-            st.session_state.confirm_delete = False
             st.rerun()
             
         st.divider()
@@ -175,54 +173,41 @@ else:
                 count = unread_counts.get(contact['id'], 0)
                 btn_text = f"{contact['username']} (🟢 {count})" if count > 0 else contact['username']
                 
+                # Highlight the active chat
                 is_active = st.session_state.chat_with and st.session_state.chat_with['id'] == contact['id']
                 btn_type = "primary" if is_active else "secondary"
                 
                 if st.button(btn_text, key=contact['id'], use_container_width=True, type=btn_type):
                     st.session_state.chat_with = contact
-                    st.session_state.confirm_delete = False # Reset delete toggle if changing chats
                     st.rerun()
         else:
             st.info("No contacts yet.")
 
         # --- PUSH DELETE TO BOTTOM ---
+        # Using empty containers to create vertical space before the delete button
         st.write("")
         st.write("")
         st.write("")
         st.divider()
-        
-        # --- SECURE DELETE CONFIRMATION UI ---
-        if not st.session_state.confirm_delete:
-            if st.button("🚨 Delete Account", use_container_width=True):
-                st.session_state.confirm_delete = True
+        if st.button("🚨 Delete Account", use_container_width=True):
+            try:
+                supabase.rpc("delete_user", {}).execute()
+                supabase.auth.sign_out()
+                st.session_state.user = None
+                st.session_state.profile = None
+                st.session_state.chat_with = None
+                st.success("Account deleted.")
+                time.sleep(2)
                 st.rerun()
-        else:
-            st.warning("⚠️ Are you sure? This will permanently delete your account, contacts, and all messages.")
-            col_y, col_n = st.columns(2)
-            with col_y:
-                if st.button("Yes, Delete", type="primary", use_container_width=True):
-                    try:
-                        supabase.rpc("delete_user", {}).execute()
-                        supabase.auth.sign_out()
-                        st.session_state.user = None
-                        st.session_state.profile = None
-                        st.session_state.chat_with = None
-                        st.session_state.confirm_delete = False
-                        st.success("Account deleted.")
-                        time.sleep(2)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed to delete: {str(e)}")
-            with col_n:
-                if st.button("Cancel", use_container_width=True):
-                    st.session_state.confirm_delete = False
-                    st.rerun()
+            except Exception as e:
+                st.error(f"Failed to delete: {str(e)}")
 
     # --- MAIN CHAT INTERFACE ---
     if st.session_state.chat_with:
         my_id = st.session_state.user.id
         their_id = st.session_state.chat_with['id']
         
+        # Header with Refresh button side-by-side
         head_col1, head_col2 = st.columns([4, 1])
         with head_col1:
             st.subheader(f"Chat with {st.session_state.chat_with['username']}")
@@ -230,12 +215,12 @@ else:
             if st.button("🔄 Refresh", use_container_width=True):
                 st.rerun()
         
-        # --- MAGIC CSS: column-reverse forces bottom-up alignment! ---
+        # --- ENHANCED CUSTOM CSS ---
         st.markdown("""
         <style>
         .chat-container {
             display: flex;
-            flex-direction: column-reverse; /* Reverses the flow to bottom-up */
+            flex-direction: column;
             gap: 10px;
             padding-bottom: 20px;
         }
@@ -249,13 +234,13 @@ else:
             position: relative;
         }
         .msg-mine {
-            background-color: #dcf8c6; 
+            background-color: #dcf8c6; /* WhatsApp Green */
             color: #000;
             align-self: flex-end;
             border-bottom-right-radius: 0;
         }
         .msg-theirs {
-            background-color: #ffffff; 
+            background-color: #ffffff; /* White/Light Grey */
             border: 1px solid #e0e0e0;
             color: #000;
             align-self: flex-start;
@@ -271,26 +256,26 @@ else:
             align-items: center;
             gap: 4px;
         }
-        .check-read { color: #53bdeb; font-weight: bold; } 
-        .check-delivered { color: #999; } 
+        .check-read { color: #53bdeb; font-weight: bold; } /* Blue double tick */
+        .check-delivered { color: #999; } /* Grey single tick */
         </style>
         """, unsafe_allow_html=True)
         
+        # Fetch messages
         messages_res = supabase.table("messages").select("*") \
             .or_(f"and(sender_id.eq.{my_id},receiver_id.eq.{their_id}),and(sender_id.eq.{their_id},receiver_id.eq.{my_id})") \
             .order("created_at", desc=False).execute()
         
+        # --- DISPLAY MESSAGES WITH RECEIPTS ---
         chat_html = '<div class="chat-container">'
-        
-        # --- REVERSED PYTHON LOOP ---
-        # We loop through the data backwards so the newest message is inserted first in the HTML.
-        # Combined with column-reverse CSS, this pins the newest message to the bottom!
-        for msg in reversed(messages_res.data):
+        for msg in messages_res.data:
             is_me = msg['sender_id'] == my_id
             bubble_class = "msg-mine" if is_me else "msg-theirs"
             
+            # Format time (extract HH:MM from Supabase timestamp)
             time_str = msg['created_at'][11:16] 
             
+            # Generate Read Receipts (only show for your own messages)
             receipt_html = ""
             if is_me:
                 if msg.get('is_read', False):
@@ -298,6 +283,7 @@ else:
                 else:
                     receipt_html = '<span class="check-delivered">✓</span>'
 
+            # Build the bubble (Written on single lines to prevent Markdown code-block rendering)
             chat_html += f'<div class="msg-bubble {bubble_class}">'
             chat_html += f'<div class="msg-content">{msg["content"]}</div>'
             chat_html += f'<div class="msg-meta">{time_str} {receipt_html}</div>'
@@ -309,9 +295,10 @@ else:
         with chat_container:
             st.markdown(chat_html, unsafe_allow_html=True)
         
+        # Input new message
         new_message = st.chat_input("Type your message here...")
         if new_message:
-            with st.spinner("Sending..."): 
+            with st.spinner("Sending..."): # Gives a visual indicator that something is happening
                 supabase.table("messages").insert({
                     "sender_id": my_id,
                     "receiver_id": their_id,
